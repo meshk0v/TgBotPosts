@@ -3,7 +3,7 @@ import logging
 import os
 import random
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters, raw
@@ -94,6 +94,44 @@ def _normalize_chat_id(raw: str):
         return raw
 
 
+async def _find_chat_via_dialogs(client: Client, chat_id: int):
+    async for dialog in client.get_dialogs():
+        if dialog.chat and dialog.chat.id == chat_id:
+            return dialog.chat
+    return None
+
+
+async def _warmup_chat_access(client: Client, chat_ref: Any, logger: logging.Logger) -> None:
+    try:
+        await client.get_chat(chat_ref)
+        return
+    except (RPCError, ValueError) as e:
+        if not isinstance(chat_ref, int):
+            raise
+
+        chat = await _find_chat_via_dialogs(client, chat_ref)
+        if chat is None:
+            raise
+        logger.info("Chat resolved via dialogs fallback: %s", chat_ref)
+
+
+async def _initialize_chat_cache(
+    client: Client,
+    source_chats: list[Any],
+    target_chat: Any,
+    logger: logging.Logger,
+) -> Any:
+    # Warm up source chats so peer cache is populated before first updates.
+    for source_chat in source_chats:
+        try:
+            await _warmup_chat_access(client, source_chat, logger)
+        except (RPCError, ValueError) as e:
+            logger.warning("Source chat init failed: %s (%s)", source_chat, e)
+
+    await _warmup_chat_access(client, target_chat, logger)
+    return await client.resolve_peer(target_chat)
+
+
 async def _copy_to_target(client: Client, source_message, target_chat, topic_id: Optional[int]) -> None:
     if topic_id is None:
         await client.copy_message(
@@ -122,10 +160,9 @@ async def _copy_to_target(client: Client, source_message, target_chat, topic_id:
 
 
 async def _forward_to_target(
-    client: Client, source_message, target_chat, topic_id: Optional[int]
+    client: Client, source_message, to_peer, topic_id: Optional[int]
 ) -> None:
     from_peer = await client.resolve_peer(source_message.chat.id)
-    to_peer = await client.resolve_peer(target_chat)
 
     await client.invoke(
         raw.functions.messages.ForwardMessages(
@@ -152,9 +189,11 @@ async def main() -> None:
 
     source_chats = [_normalize_chat_id(x) for x in settings.source_chats_raw]
     target_chat = _normalize_chat_id(settings.target_chat_id)
+    target_peer = None
 
     @app.on_message(filters.chat(source_chats) & filters.channel)
     async def relay_handler(client: Client, message):
+        nonlocal target_peer
         if message.media_group_id is not None:
             logger.debug(
                 "Skipping grouped media item to avoid duplicates: chat=%s msg=%s",
@@ -175,10 +214,12 @@ async def main() -> None:
                 await _copy_to_target(client, message, target_chat, settings.target_topic_id)
             else:
                 try:
+                    if target_peer is None:
+                        target_peer = await client.resolve_peer(target_chat)
                     await _forward_to_target(
-                        client, message, target_chat, settings.target_topic_id
+                        client, message, target_peer, settings.target_topic_id
                     )
-                except RPCError:
+                except (RPCError, ValueError):
                     logger.warning(
                         "Forward failed; fallback to copy for topic support: chat=%s msg=%s",
                         message.chat.id,
@@ -193,7 +234,7 @@ async def main() -> None:
                 target_chat,
                 settings.target_topic_id,
             )
-        except RPCError as e:
+        except (RPCError, ValueError) as e:
             logger.exception(
                 "Failed to relay message: source_chat=%s source_msg=%s error=%s",
                 message.chat.id,
@@ -206,6 +247,17 @@ async def main() -> None:
     logger.info("Session directory: %s | Log file: %s", settings.session_dir, settings.log_file)
 
     async with app:
+        try:
+            target_peer = await _initialize_chat_cache(
+                client=app,
+                source_chats=source_chats,
+                target_chat=target_chat,
+                logger=logger,
+            )
+            logger.info("Chat cache initialized successfully")
+        except (RPCError, ValueError) as e:
+            logger.exception("Target chat init failed: %s", e)
+            raise
         await asyncio.Event().wait()
 
 
