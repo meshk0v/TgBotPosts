@@ -235,32 +235,20 @@ async def main() -> None:
         nonlocal target_peer, resolved_source_ids, processed_media_groups, last_seen_ids
 
         if message.chat is None:
-            if settings.debug_updates:
-                logger.info(
-                    "Skip update without chat (%s): message_id=%s",
-                    origin,
-                    getattr(message, "id", None),
-                )
+            return
+
+        if resolved_source_ids and message.chat.id not in resolved_source_ids:
             return
 
         if settings.debug_updates:
             logger.info(
-                "Incoming update (%s): chat_id=%s type=%s msg_id=%s media_group=%s",
+                "Incoming source update (%s): chat_id=%s type=%s msg_id=%s media_group=%s",
                 origin,
                 message.chat.id,
                 message.chat.type,
                 message.id,
                 message.media_group_id,
             )
-        if resolved_source_ids and message.chat.id not in resolved_source_ids:
-            if settings.debug_updates:
-                logger.info(
-                    "Skip not-in-sources (%s): chat_id=%s msg_id=%s",
-                    origin,
-                    message.chat.id,
-                    message.id,
-                )
-            return
 
         if message.media_group_id is not None:
             media_group_key = f"{message.chat.id}:{message.media_group_id}"
