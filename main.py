@@ -159,20 +159,41 @@ async def _copy_to_target(client: Client, source_message, target_chat, topic_id:
         )
 
 
-async def _forward_to_target(
-    client: Client, source_message, to_peer, topic_id: Optional[int]
+async def _copy_batch_to_target(
+    client: Client, source_messages: list, target_chat, topic_id: Optional[int]
 ) -> None:
-    from_peer = await client.resolve_peer(source_message.chat.id)
+    for source_message in source_messages:
+        await _copy_to_target(client, source_message, target_chat, topic_id)
+
+
+async def _forward_to_target(
+    client: Client, from_chat_id: int, message_ids: list[int], to_peer, topic_id: Optional[int]
+) -> None:
+    from_peer = await client.resolve_peer(from_chat_id)
 
     await client.invoke(
         raw.functions.messages.ForwardMessages(
             from_peer=from_peer,
-            id=[source_message.id],
-            random_id=[random.randint(1, 2**63 - 1)],
+            id=message_ids,
+            random_id=[random.randint(1, 2**63 - 1) for _ in message_ids],
             to_peer=to_peer,
             top_msg_id=topic_id,
         )
     )
+
+
+async def _collect_post_messages(client: Client, message) -> list:
+    if message.media_group_id is None:
+        return [message]
+
+    group = await client.get_media_group(message.chat.id, message.id)
+    sorted_group = sorted(group, key=lambda m: m.id)
+
+    # Process an album only once to avoid duplicates from per-item updates.
+    if message.id != sorted_group[0].id:
+        return []
+
+    return sorted_group
 
 
 async def main() -> None:
@@ -194,30 +215,34 @@ async def main() -> None:
     @app.on_message(filters.chat(source_chats) & filters.channel)
     async def relay_handler(client: Client, message):
         nonlocal target_peer
-        if message.media_group_id is not None:
-            logger.debug(
-                "Skipping grouped media item to avoid duplicates: chat=%s msg=%s",
-                message.chat.id,
-                message.id,
-            )
+        source_messages = await _collect_post_messages(client, message)
+        if not source_messages:
             return
+        message_ids = [m.id for m in source_messages]
 
         logger.info(
-            "New post: source_chat=%s source_msg=%s copy_mode=%s",
+            "New post: source_chat=%s source_msg=%s copy_mode=%s batch_size=%s",
             message.chat.id,
             message.id,
             settings.copy_mode,
+            len(source_messages),
         )
 
         try:
             if settings.copy_mode:
-                await _copy_to_target(client, message, target_chat, settings.target_topic_id)
+                await _copy_batch_to_target(
+                    client, source_messages, target_chat, settings.target_topic_id
+                )
             else:
                 try:
                     if target_peer is None:
                         target_peer = await client.resolve_peer(target_chat)
                     await _forward_to_target(
-                        client, message, target_peer, settings.target_topic_id
+                        client,
+                        from_chat_id=message.chat.id,
+                        message_ids=message_ids,
+                        to_peer=target_peer,
+                        topic_id=settings.target_topic_id,
                     )
                 except (RPCError, ValueError):
                     logger.warning(
@@ -225,7 +250,9 @@ async def main() -> None:
                         message.chat.id,
                         message.id,
                     )
-                    await _copy_to_target(client, message, target_chat, settings.target_topic_id)
+                    await _copy_batch_to_target(
+                        client, source_messages, target_chat, settings.target_topic_id
+                    )
 
             logger.info(
                 "Delivered: source_chat=%s source_msg=%s -> target_chat=%s topic=%s",
