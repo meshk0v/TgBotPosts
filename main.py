@@ -102,10 +102,9 @@ async def _find_chat_via_dialogs(client: Client, chat_id: int):
     return None
 
 
-async def _warmup_chat_access(client: Client, chat_ref: Any, logger: logging.Logger) -> None:
+async def _resolve_chat(client: Client, chat_ref: Any, logger: logging.Logger):
     try:
-        await client.get_chat(chat_ref)
-        return
+        return await client.get_chat(chat_ref)
     except (RPCError, ValueError) as e:
         if not isinstance(chat_ref, int):
             raise
@@ -114,6 +113,7 @@ async def _warmup_chat_access(client: Client, chat_ref: Any, logger: logging.Log
         if chat is None:
             raise
         logger.info("Chat resolved via dialogs fallback: %s", chat_ref)
+        return chat
 
 
 async def _initialize_chat_cache(
@@ -121,16 +121,29 @@ async def _initialize_chat_cache(
     source_chats: list[Any],
     target_chat: Any,
     logger: logging.Logger,
-) -> Any:
+) -> tuple[Any, set[int]]:
     # Warm up source chats so peer cache is populated before first updates.
+    resolved_source_ids: set[int] = set()
     for source_chat in source_chats:
         try:
-            await _warmup_chat_access(client, source_chat, logger)
+            chat = await _resolve_chat(client, source_chat, logger)
+            resolved_source_ids.add(chat.id)
+            logger.info(
+                "Source chat initialized: ref=%s resolved_id=%s title=%s",
+                source_chat,
+                chat.id,
+                chat.title,
+            )
         except (RPCError, ValueError) as e:
             logger.warning("Source chat init failed: %s (%s)", source_chat, e)
 
-    await _warmup_chat_access(client, target_chat, logger)
-    return await client.resolve_peer(target_chat)
+    target = await _resolve_chat(client, target_chat, logger)
+    logger.info(
+        "Target chat initialized: resolved_id=%s title=%s",
+        target.id,
+        target.title,
+    )
+    return await client.resolve_peer(target_chat), resolved_source_ids
 
 
 async def _copy_to_target(client: Client, source_message, target_chat, topic_id: Optional[int]) -> None:
@@ -206,11 +219,15 @@ async def main() -> None:
     source_chats = [_normalize_chat_id(x) for x in settings.source_chats_raw]
     target_chat = _normalize_chat_id(settings.target_chat_id)
     target_peer = None
+    resolved_source_ids: set[int] = set()
     processed_media_groups: dict[str, float] = {}
 
-    @app.on_message(filters.chat(source_chats) & filters.channel)
+    @app.on_message(filters.channel)
     async def relay_handler(client: Client, message):
-        nonlocal target_peer, processed_media_groups
+        nonlocal target_peer, resolved_source_ids, processed_media_groups
+
+        if resolved_source_ids and message.chat.id not in resolved_source_ids:
+            return
 
         if message.media_group_id is not None:
             media_group_key = f"{message.chat.id}:{message.media_group_id}"
@@ -301,13 +318,17 @@ async def main() -> None:
 
     async with app:
         try:
-            target_peer = await _initialize_chat_cache(
+            target_peer, resolved_source_ids = await _initialize_chat_cache(
                 client=app,
                 source_chats=source_chats,
                 target_chat=target_chat,
                 logger=logger,
             )
-            logger.info("Chat cache initialized successfully")
+            logger.info(
+                "Chat cache initialized successfully: sources_resolved=%s/%s",
+                len(resolved_source_ids),
+                len(source_chats),
+            )
         except (RPCError, ValueError) as e:
             logger.exception("Target chat init failed: %s", e)
             raise
