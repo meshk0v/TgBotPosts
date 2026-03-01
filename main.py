@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import os
 import random
@@ -23,6 +24,7 @@ class Settings:
     copy_mode: bool
     log_file: str
     debug_updates: bool
+    poll_interval_seconds: int
 
 
 def _parse_bool(value: str, default: bool = True) -> bool:
@@ -44,6 +46,7 @@ def load_settings() -> Settings:
     copy_mode = _parse_bool(os.getenv("COPY_MODE", "true"), default=True)
     log_file = os.getenv("LOG_FILE", "./logs/relay.log")
     debug_updates = _parse_bool(os.getenv("DEBUG_UPDATES", "false"), default=False)
+    poll_interval_seconds = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
 
     if not api_id:
         raise ValueError("API_ID is required")
@@ -71,6 +74,7 @@ def load_settings() -> Settings:
         copy_mode=copy_mode,
         log_file=log_file,
         debug_updates=debug_updates,
+        poll_interval_seconds=poll_interval_seconds,
     )
 
 
@@ -225,19 +229,24 @@ async def main() -> None:
     target_peer = None
     resolved_source_ids: set[int] = set()
     processed_media_groups: dict[str, float] = {}
+    last_seen_ids: dict[int, int] = {}
 
-    @app.on_message(filters.all)
-    async def relay_handler(client: Client, message):
-        nonlocal target_peer, resolved_source_ids, processed_media_groups
+    async def process_source_message(client: Client, message, origin: str) -> None:
+        nonlocal target_peer, resolved_source_ids, processed_media_groups, last_seen_ids
 
         if message.chat is None:
             if settings.debug_updates:
-                logger.info("Skip update without chat: message_id=%s", getattr(message, "id", None))
+                logger.info(
+                    "Skip update without chat (%s): message_id=%s",
+                    origin,
+                    getattr(message, "id", None),
+                )
             return
 
         if settings.debug_updates:
             logger.info(
-                "Incoming update: chat_id=%s type=%s msg_id=%s media_group=%s",
+                "Incoming update (%s): chat_id=%s type=%s msg_id=%s media_group=%s",
+                origin,
                 message.chat.id,
                 message.chat.type,
                 message.id,
@@ -245,7 +254,12 @@ async def main() -> None:
             )
         if resolved_source_ids and message.chat.id not in resolved_source_ids:
             if settings.debug_updates:
-                logger.info("Skip not-in-sources: chat_id=%s msg_id=%s", message.chat.id, message.id)
+                logger.info(
+                    "Skip not-in-sources (%s): chat_id=%s msg_id=%s",
+                    origin,
+                    message.chat.id,
+                    message.id,
+                )
             return
 
         if message.media_group_id is not None:
@@ -280,9 +294,11 @@ async def main() -> None:
         if not source_messages:
             return
         message_ids = [m.id for m in source_messages]
+        last_seen_ids[message.chat.id] = max(last_seen_ids.get(message.chat.id, 0), max(message_ids))
 
         logger.info(
-            "New post: source_chat=%s source_msg=%s copy_mode=%s batch_size=%s media_group=%s",
+            "New post (%s): source_chat=%s source_msg=%s copy_mode=%s batch_size=%s media_group=%s",
+            origin,
             message.chat.id,
             message.id,
             settings.copy_mode,
@@ -317,7 +333,8 @@ async def main() -> None:
                     )
 
             logger.info(
-                "Delivered: source_chat=%s source_msg=%s -> target_chat=%s topic=%s",
+                "Delivered (%s): source_chat=%s source_msg=%s -> target_chat=%s topic=%s",
+                origin,
                 message.chat.id,
                 message.id,
                 target_chat,
@@ -325,16 +342,39 @@ async def main() -> None:
             )
         except (RPCError, ValueError) as e:
             logger.exception(
-                "Failed to relay message: source_chat=%s source_msg=%s error=%s",
+                "Failed to relay message (%s): source_chat=%s source_msg=%s error=%s",
+                origin,
                 message.chat.id,
                 message.id,
                 e,
             )
 
+    async def poll_sources_loop() -> None:
+        while True:
+            try:
+                for chat_id in sorted(resolved_source_ids):
+                    history = [m async for m in app.get_chat_history(chat_id, limit=10)]
+                    if not history:
+                        continue
+                    history = list(reversed(history))
+                    baseline = last_seen_ids.get(chat_id, 0)
+                    for item in history:
+                        if item.id > baseline:
+                            await process_source_message(app, item, origin="poll")
+                    last_seen_ids[chat_id] = max(last_seen_ids.get(chat_id, 0), history[-1].id)
+            except Exception:
+                logger.exception("Polling iteration failed")
+            await asyncio.sleep(settings.poll_interval_seconds)
+
+    @app.on_message(filters.all)
+    async def relay_handler(client: Client, message):
+        await process_source_message(client, message, origin="rt")
+
     logger.info("Watching source chats: %s", settings.source_chats_raw)
     logger.info("Target chat: %s | topic: %s", settings.target_chat_id, settings.target_topic_id)
     logger.info("Session directory: %s | Log file: %s", settings.session_dir, settings.log_file)
     logger.info("Debug updates: %s", settings.debug_updates)
+    logger.info("Poll interval (seconds): %s", settings.poll_interval_seconds)
 
     async with app:
         try:
@@ -350,10 +390,22 @@ async def main() -> None:
                 len(source_chats),
             )
             logger.info("Resolved source chat ids: %s", sorted(resolved_source_ids))
+            for source_id in sorted(resolved_source_ids):
+                latest = [m async for m in app.get_chat_history(source_id, limit=1)]
+                if latest:
+                    last_seen_ids[source_id] = latest[0].id
+            logger.info("Polling baselines initialized for %s source chats", len(last_seen_ids))
         except (RPCError, ValueError) as e:
             logger.exception("Target chat init failed: %s", e)
             raise
-        await asyncio.Event().wait()
+
+        poll_task = asyncio.create_task(poll_sources_loop())
+        try:
+            await asyncio.Event().wait()
+        finally:
+            poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await poll_task
 
 
 if __name__ == "__main__":
