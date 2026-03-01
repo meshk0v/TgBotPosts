@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+
+# Local env/secrets
+.env
+.env.*
+!.env.example
+
+# Telegram session files
+*.session
+*.session-journal
+
+# Logs and runtime data
+logs/
+data/
+*.log
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
