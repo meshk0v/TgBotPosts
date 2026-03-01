@@ -129,9 +129,10 @@ async def _initialize_chat_cache(
             chat = await _resolve_chat(client, source_chat, logger)
             resolved_source_ids.add(chat.id)
             logger.info(
-                "Source chat initialized: ref=%s resolved_id=%s title=%s",
+                "Source chat initialized: ref=%s resolved_id=%s type=%s title=%s",
                 source_chat,
                 chat.id,
+                chat.type,
                 chat.title,
             )
         except (RPCError, ValueError) as e:
@@ -222,10 +223,12 @@ async def main() -> None:
     resolved_source_ids: set[int] = set()
     processed_media_groups: dict[str, float] = {}
 
-    @app.on_message(filters.channel)
+    @app.on_message(filters.all)
     async def relay_handler(client: Client, message):
         nonlocal target_peer, resolved_source_ids, processed_media_groups
 
+        if message.chat is None:
+            return
         if resolved_source_ids and message.chat.id not in resolved_source_ids:
             return
 
