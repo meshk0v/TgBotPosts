@@ -22,6 +22,7 @@ class Settings:
     target_topic_id: Optional[int]
     copy_mode: bool
     log_file: str
+    debug_updates: bool
 
 
 def _parse_bool(value: str, default: bool = True) -> bool:
@@ -42,6 +43,7 @@ def load_settings() -> Settings:
     target_topic_id = os.getenv("TARGET_TOPIC_ID", "").strip()
     copy_mode = _parse_bool(os.getenv("COPY_MODE", "true"), default=True)
     log_file = os.getenv("LOG_FILE", "./logs/relay.log")
+    debug_updates = _parse_bool(os.getenv("DEBUG_UPDATES", "false"), default=False)
 
     if not api_id:
         raise ValueError("API_ID is required")
@@ -68,6 +70,7 @@ def load_settings() -> Settings:
         target_topic_id=topic_id,
         copy_mode=copy_mode,
         log_file=log_file,
+        debug_updates=debug_updates,
     )
 
 
@@ -228,8 +231,21 @@ async def main() -> None:
         nonlocal target_peer, resolved_source_ids, processed_media_groups
 
         if message.chat is None:
+            if settings.debug_updates:
+                logger.info("Skip update without chat: message_id=%s", getattr(message, "id", None))
             return
+
+        if settings.debug_updates:
+            logger.info(
+                "Incoming update: chat_id=%s type=%s msg_id=%s media_group=%s",
+                message.chat.id,
+                message.chat.type,
+                message.id,
+                message.media_group_id,
+            )
         if resolved_source_ids and message.chat.id not in resolved_source_ids:
+            if settings.debug_updates:
+                logger.info("Skip not-in-sources: chat_id=%s msg_id=%s", message.chat.id, message.id)
             return
 
         if message.media_group_id is not None:
@@ -318,6 +334,7 @@ async def main() -> None:
     logger.info("Watching source chats: %s", settings.source_chats_raw)
     logger.info("Target chat: %s | topic: %s", settings.target_chat_id, settings.target_topic_id)
     logger.info("Session directory: %s | Log file: %s", settings.session_dir, settings.log_file)
+    logger.info("Debug updates: %s", settings.debug_updates)
 
     async with app:
         try:
@@ -332,6 +349,7 @@ async def main() -> None:
                 len(resolved_source_ids),
                 len(source_chats),
             )
+            logger.info("Resolved source chat ids: %s", sorted(resolved_source_ids))
         except (RPCError, ValueError) as e:
             logger.exception("Target chat init failed: %s", e)
             raise
