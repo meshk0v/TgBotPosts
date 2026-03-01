@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -187,13 +188,7 @@ async def _collect_post_messages(client: Client, message) -> list:
         return [message]
 
     group = await client.get_media_group(message.chat.id, message.id)
-    sorted_group = sorted(group, key=lambda m: m.id)
-
-    # Process an album only once to avoid duplicates from per-item updates.
-    if message.id != sorted_group[0].id:
-        return []
-
-    return sorted_group
+    return sorted(group, key=lambda m: m.id)
 
 
 async def main() -> None:
@@ -211,21 +206,52 @@ async def main() -> None:
     source_chats = [_normalize_chat_id(x) for x in settings.source_chats_raw]
     target_chat = _normalize_chat_id(settings.target_chat_id)
     target_peer = None
+    processed_media_groups: dict[str, float] = {}
 
     @app.on_message(filters.chat(source_chats) & filters.channel)
     async def relay_handler(client: Client, message):
-        nonlocal target_peer
-        source_messages = await _collect_post_messages(client, message)
+        nonlocal target_peer, processed_media_groups
+
+        if message.media_group_id is not None:
+            media_group_key = f"{message.chat.id}:{message.media_group_id}"
+            if media_group_key in processed_media_groups:
+                logger.debug("Skipping already processed media group: %s", media_group_key)
+                return
+            # Give Telegram a brief moment so all album items are available.
+            await asyncio.sleep(1.0)
+
+        try:
+            source_messages = await _collect_post_messages(client, message)
+        except RPCError as e:
+            logger.warning(
+                "Failed to fetch media group, fallback to single message: chat=%s msg=%s error=%s",
+                message.chat.id,
+                message.id,
+                e,
+            )
+            source_messages = [message]
+
+        if message.media_group_id is not None:
+            media_group_key = f"{message.chat.id}:{message.media_group_id}"
+            processed_media_groups[media_group_key] = time.time()
+            # Keep memory bounded.
+            if len(processed_media_groups) > 1000:
+                cutoff = time.time() - 24 * 60 * 60
+                processed_media_groups = {
+                    key: ts for key, ts in processed_media_groups.items() if ts >= cutoff
+                }
+
         if not source_messages:
             return
         message_ids = [m.id for m in source_messages]
 
         logger.info(
-            "New post: source_chat=%s source_msg=%s copy_mode=%s batch_size=%s",
+            "New post: source_chat=%s source_msg=%s copy_mode=%s batch_size=%s media_group=%s",
             message.chat.id,
             message.id,
             settings.copy_mode,
             len(source_messages),
+            message.media_group_id,
         )
 
         try:
